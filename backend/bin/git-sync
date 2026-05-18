@@ -1,0 +1,45 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Auto-git for CodeMentor — push whenever prudent
+
+BASE="$HOME/CodeMentor-MVP"
+cd "$BASE" || exit 1
+
+# Init if needed
+if [[ ! -d .git ]]; then
+    git init
+    git config user.email "codementor@local.dev"
+    git config user.name "CodeMentor Bot"
+    echo "database/*.db" > .gitignore
+    echo "cache/" >> .gitignore
+    echo "config/api.json" >> .gitignore
+    echo "*.pyc" >> .gitignore
+    echo "__pycache__/" >> .gitignore
+    echo "[+] Git initialized with privacy ignores"
+fi
+
+# Check for remote
+if ! git remote -v >/dev/null 2>&1; then
+    echo "[!] No remote configured."
+    echo "    Run: git remote add origin https://github.com/YOURNAME/CodeMentor-MVP.git"
+    echo "    Then: git-sync again"
+    exit 1
+fi
+
+# Stage everything except ignored
+git add -A
+
+# Only commit if there are changes
+if git diff --cached --quiet; then
+    echo "[=] Nothing to commit. Repo is clean."
+else
+    git commit -m "auto: $(date '+%Y-%m-%d %H:%M') | $(git diff --cached --stat | tail -1)"
+    git pull --rebase origin main 2>/dev/null || git pull --rebase origin master 2>/dev/null || true
+    git push origin main 2>/dev/null || git push origin master 2>/dev/null || echo "[!] Push failed — check network/auth"
+    echo "[+] Synced at $(date -Iseconds)"
+fi
+
+# Show status
+echo ""
+git log --oneline -3
+echo ""
+git status -s

@@ -1,0 +1,544 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# CodeMentor CLI v2.1 — Adversarial Edition
+# Database: SQLite for developer pain points, challenge marketplace, A/B testing
+
+BASE="$HOME/CodeMentor-MVP"
+CONFIG="$BASE/config/api.json"
+CACHE="$BASE/cache"
+ANALYTICS="$BASE/analytics"
+DB="$BASE/database/codementor.db"
+QUESTS="$BASE/quests"
+EXTENSIONS="$BASE/extensions"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; PURPLE='\033[0;35m'; NC='\033[0m'
+
+# --- DATABASE INIT (SQLite — built into Termux Python) ---
+init_db() {
+    python3 -c "
+import sqlite3, os
+db = '$DB'
+os.makedirs(os.path.dirname(db), exist_ok=True)
+conn = sqlite3.connect(db)
+c = conn.cursor()
+
+# Developer pain points (adversarial intel)
+c.execute('''CREATE TABLE IF NOT EXISTS pain_points (
+    id INTEGER PRIMARY KEY,
+    user_hash TEXT,           -- anonymized device fingerprint
+    language TEXT,
+    error_type TEXT,
+    code_snippet TEXT,
+    ai_explanation TEXT,
+    human_rating INTEGER,     -- 1-5, did it help?
+    timestamp TEXT,
+    source TEXT               -- 'gemini', 'claude', 'local', 'community'
+)''')
+
+# Challenge marketplace (side quests from other AIs)
+c.execute('''CREATE TABLE IF NOT EXISTS challenges (
+    id INTEGER PRIMARY KEY,
+    title TEXT,
+    difficulty TEXT,          -- 'tutorial', 'medium', 'nightmare'
+    language TEXT,
+    prompt TEXT,
+    test_cases TEXT,           -- JSON array
+    solution_hash TEXT,        -- SHA256 of canonical solution
+    author TEXT,               -- 'openai', 'anthropic', 'community', 'codementor'
+    bounty REAL,               -- $0 = free, >0 = paid challenge
+    solves INTEGER DEFAULT 0,
+    avg_time_seconds INTEGER,
+    tags TEXT,                 -- JSON array
+    created_at TEXT
+)''')
+
+# User progress (gamification)
+c.execute('''CREATE TABLE IF NOT EXISTS user_progress (
+    user_hash TEXT PRIMARY KEY,
+    xp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    streak_days INTEGER DEFAULT 0,
+    last_active TEXT,
+    solved_challenges TEXT,    -- JSON array of challenge IDs
+    badges TEXT,               -- JSON array
+    tier TEXT DEFAULT 'free'   -- free, pro, enterprise
+)''')
+
+# Adversarial comparisons (which AI model wins?)
+c.execute('''CREATE TABLE IF NOT EXISTS ai_battles (
+    id INTEGER PRIMARY KEY,
+    challenge_id INTEGER,
+    model_a TEXT,
+    model_b TEXT,
+    winner TEXT,               -- model_a, model_b, tie
+    judge_model TEXT,
+    reasoning TEXT,
+    timestamp TEXT
+)''')
+
+# CodeRabbit smash data — where we outperform competitors
+c.execute('''CREATE TABLE IF NOT EXISTS competitive_intel (
+    id INTEGER PRIMARY KEY,
+    competitor TEXT,           -- 'coderabbit', 'github_copilot', 'cursor', 'aider'
+    feature TEXT,
+    our_score REAL,
+    their_score REAL,
+    test_case TEXT,
+    timestamp TEXT
+)''')
+
+conn.commit()
+conn.close()
+print('[+] Adversarial database initialized')
+"
+}
+
+# --- PAIN POINT LOGGING (every explanation gets logged for pattern mining) ---
+log_pain_point() {
+    local lang="$1" error_type="$2" snippet="$3" explanation="$4" rating="${5:-0}"
+    python3 -c "
+import sqlite3, hashlib, datetime
+db = '$DB'
+conn = sqlite3.connect(db)
+# Anonymized fingerprint (device + day, not personal)
+fp = hashlib.sha256(open('/proc/sys/kernel/hostname').read().encode()).hexdigest()[:16]
+c = conn.cursor()
+c.execute('INSERT INTO pain_points VALUES (NULL,?,?,?,?,?,?,?,?)',
+    (fp, '$lang', '$error_type', '''$snippet''', '''$explanation''', $rating, datetime.datetime.now().isoformat(), 'codementor'))
+conn.commit()
+conn.close()
+"
+}
+
+# --- CHALLENGE SEEDER (pre-load with AI-generated quests) ---
+seed_challenges() {
+    python3 -c "
+import sqlite3, json, datetime
+db = '$DB'
+conn = sqlite3.connect(db)
+c = conn.cursor()
+
+challenges = [
+    ('Two Sum Optimized', 'tutorial', 'python', 'Given nums and target, return indices. Optimize beyond O(n²).', 
+     json.dumps([{'input':'[2,7,11,15], 9','expected':'[0,1]'}]), '', 'codementor', 0.0, 0, 0, json.dumps(['arrays','hashmap']), datetime.datetime.now().isoformat()),
+    ('Async Hell Refactor', 'medium', 'javascript', 'Convert callback pyramid to async/await with proper error boundaries.',
+     json.dumps([{'input':'nested callbacks','expected':'flat async'}]), '', 'anthropic', 5.0, 0, 0, json.dumps(['async','refactoring']), datetime.datetime.now().isoformat()),
+    ('Memory Leak Hunter', 'nightmare', 'rust', 'Find and fix the unsafe memory leak in this FFI boundary code.',
+     json.dumps([{'input':'leaky ffi','expected':'valgrind clean'}]), '', 'community', 25.0, 0, 0, json.dumps(['rust','ffi','memory']), datetime.datetime.now().isoformat()),
+    ('Prompt Injection Defense', 'nightmare', 'python', 'Secure this LLM API wrapper against jailbreak attempts.',
+     json.dumps([{'input':'ignore previous instructions','expected':'blocked'}]), '', 'openai', 50.0, 0, 0, json.dumps(['security','llm','adversarial']), datetime.datetime.now().isoformat()),
+]
+
+c.executemany('INSERT OR IGNORE INTO challenges VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?)', challenges)
+conn.commit()
+conn.close()
+print('[+] Challenge marketplace seeded with ' + str(len(challenges)) + ' quests')
+"
+}
+
+# --- XP / LEVELING SYSTEM ---
+add_xp() {
+    local xp_gain="$1"
+    python3 -c "
+import sqlite3, hashlib, datetime, json
+db = '$DB'
+conn = sqlite3.connect(db)
+fp = hashlib.sha256(open('/proc/sys/kernel/hostname').read().encode()).hexdigest()[:16]
+c = conn.cursor()
+
+c.execute('SELECT xp, level, streak_days, solved_challenges, badges FROM user_progress WHERE user_hash=?', (fp,))
+row = c.fetchone()
+
+if row:
+    xp, lvl, streak, solved, badges = row
+    xp += $xp_gain
+    new_lvl = int(xp / 1000) + 1
+    badges = json.loads(badges) if badges else []
+    if new_lvl > lvl and new_lvl % 5 == 0:
+        badges.append('Level_' + str(new_lvl))
+    c.execute('UPDATE user_progress SET xp=?, level=?, last_active=? WHERE user_hash=?',
+        (xp, new_lvl, datetime.datetime.now().isoformat(), fp))
+    print(f'[XP] +$xp_gain | Total: {xp} | Level: {new_lvl}')
+else:
+    c.execute('INSERT INTO user_progress VALUES (?,?,1,0,?,?,\'[]\',\'[]\',\'free\')',
+        (fp, $xp_gain, datetime.datetime.now().isoformat()))
+    print(f'[XP] +$xp_gain | New user created!')
+conn.commit()
+conn.close()
+"
+}
+
+# --- COMPETITIVE INTEL (CodeRabbit smashing) ---
+log_competitive() {
+    local competitor="$1" feature="$2" our_score="$3" their_score="$4"
+    python3 -c "
+import sqlite3, datetime
+db = '$DB'
+conn = sqlite3.connect(db)
+c = conn.cursor()
+c.execute('INSERT INTO competitive_intel VALUES (NULL,?,?,?,?,?,?)',
+    ('$competitor', '$feature', $our_score, $their_score, 'automated_benchmark', datetime.datetime.now().isoformat()))
+conn.commit()
+conn.close()
+print('[Intel] ' + '$competitor' + ' | ' + '$feature' + ': Us=' + str($our_score) + ' Them=' + str($their_score))
+"
+}
+
+# --- SETUP ---
+setup() {
+    echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  CodeMentor Adversarial SaaS Setup v2.1  ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+    init_db
+    seed_challenges
+    
+    echo ""
+    echo "Select AI Provider:"
+    echo "  [1] Gemini (free tier: 1500 req/day)"
+    echo "  [2] OpenRouter (100+ models, pay-as-you-go)"
+    echo "  [3] Local/Ollama (offline, self-hosted)"
+    echo ""
+    echo -n "Choice [1/2/3]: "
+    read -r choice
+    
+    if [[ "$choice" == "2" ]]; then
+        echo -n "OpenRouter API Key: "; read -r key
+        echo -n "Model [anthropic/claude-3.5-sonnet]: "; read -r model
+        model=${model:-anthropic/claude-3.5-sonnet}
+        echo "{\"provider\":\"openrouter\",\"api_key\":\"$key\",\"model\":\"$model\"}" > "$CONFIG"
+    elif [[ "$choice" == "3" ]]; then
+        echo -n "Ollama endpoint [http://localhost:11434]: "; read -r endpoint
+        endpoint=${endpoint:-http://localhost:11434}
+        echo "{\"provider\":\"ollama\",\"endpoint\":\"$endpoint\",\"model\":\"codellama:13b\"}" > "$CONFIG"
+    else
+        echo -n "Gemini API Key: "; read -r key
+        echo -n "Model [gemini-2.0-flash]: "; read -r model
+        model=${model:-gemini-2.0-flash}
+        echo "{\"provider\":\"gemini\",\"api_key\":\"$key\",\"model\":\"$model\"}" > "$CONFIG"
+    fi
+    
+    echo -e "${GREEN}[+] Config + adversarial database ready${NC}"
+    echo -e "${YELLOW}[!] Run: mentor --quest to start your first challenge${NC}"
+}
+
+# --- CHALLENGE MODE ---
+run_quest() {
+    echo -e "${PURPLE}╔══════════════════════════════════════╗${NC}"
+    echo -e "${PURPLE}║      🗡️  CHALLENGE MARKETPLACE       ║${NC}"
+    echo -e "${PURPLE}╚══════════════════════════════════════╝${NC}"
+    
+    python3 -c "
+import sqlite3, random, json
+db = '$DB'
+conn = sqlite3.connect(db)
+c = conn.cursor()
+
+c.execute('SELECT id, title, difficulty, language, prompt, bounty, tags FROM challenges ORDER BY RANDOM() LIMIT 5')
+rows = c.fetchall()
+
+print('\nAvailable Side Quests:\n')
+for i, (id, title, diff, lang, prompt, bounty, tags) in enumerate(rows, 1):
+    tier_icon = '🟢' if diff == 'tutorial' else '🟡' if diff == 'medium' else '🔴'
+    price = 'FREE' if bounty == 0 else f'\\${bounty:.0f}'
+    print(f'{i}. {tier_icon} [{diff.upper()}] {title} ({lang}) — {price}')
+    print(f'   Tags: {json.loads(tags) if tags else []}')
+    print(f'   {prompt[:80]}...')
+    print()
+
+choice = input('Select quest [1-5] or [r]andom: ')
+if choice.lower() == 'r':
+    choice = str(random.randint(1, 5))
+
+try:
+    idx = int(choice) - 1
+    selected = rows[idx]
+    print(f'\n🎯 QUEST ACCEPTED: {selected[1]}')
+    print(f'Difficulty: {selected[2]}')
+    print(f'Language: {selected[3]}')
+    print(f'\n{selected[4]}')
+    print(f'\nTest cases: {json.loads(selected[5]) if selected[5] else []}')
+except:
+    print('Invalid selection.')
+conn.close()
+"
+    add_xp 50
+}
+
+# --- AI BATTLE MODE (A/B test models against each other) ---
+run_battle() {
+    echo -e "${CYAN}⚔️  AI BATTLE MODE — Model vs Model${NC}"
+    echo "This sends the same challenge to two different models and judges the winner."
+    echo -n "Challenge file: "; read -r cfile
+    echo -n "Model A [gemini-2.0-flash]: "; read -r ma
+    ma=${ma:-gemini-2.0-flash}
+    echo -n "Model B [claude-3.5-sonnet]: "; read -r mb
+    mb=${mb:-claude-3.5-sonnet}
+    
+    python3 "$BASE/lib/ai_explain.py" "$cfile" --battle "$ma" "$mb"
+}
+
+# --- USAGE / REPORTING ---
+show_help() {
+    cat << 'HELP'
+CodeMentor CLI v2.1 — Adversarial SaaS Edition
+
+CORE:
+  mentor <file>                    Full AI explanation + analytics
+  mentor <file> --analytics-only   Static analysis (free, no API)
+  mentor <file> --chart            Generate complexity visualization
+  mentor <file> --html             Raw HTML output
+
+ADVENTURE / MONETIZATION:
+  mentor --quest                   Start a coding challenge (side quest)
+  mentor --battle                  A/B test two AI models
+  mentor --leaderboard             Top solvers this week
+  mentor --marketplace             Browse paid challenges
+
+INTEL / COMPETITIVE:
+  mentor --smash <competitor>      Log competitive benchmark
+  mentor --intel                   View competitive intelligence dashboard
+
+SYSTEM:
+  mentor --setup                   Init database + config
+  mentor --report                  Usage + pain point analytics
+  mentor --serve [port]            Web dashboard
+  mentor --export-db               Dump SQLite for analysis
+  mentor --git-push                Auto-commit and push to repo
+
+SaaS TIERS:
+  FREE:  50 explanations/month, basic quests
+  PRO:   Unlimited + AI battles + team leaderboard ($9/mo)
+  ENTERPRISE: Custom models + SSO + adversarial training data ($49/mo)
+HELP
+}
+
+# --- GIT AUTO-PUSH ---
+git_push() {
+    cd "$BASE" || return
+    git init 2>/dev/null || true
+    git add -A
+    git commit -m "codementor: $(date -Iseconds) — auto-backup" 2>/dev/null || echo "Nothing to commit"
+    if git remote -v >/dev/null 2>&1; then
+        git push origin main 2>/dev/null || git push origin master 2>/dev/null || echo "No remote configured. Add with: git remote add origin <url>"
+    else
+        echo "[!] No remote. Set up GitHub repo and run:"
+        echo "    git remote add origin https://github.com/YOU/CodeMentor-MVP.git"
+        echo "    git branch -M main"
+        echo "    git push -u origin main"
+    fi
+}
+
+# --- EXPORT DATABASE ---
+export_db() {
+    local out="$BASE/database/export_$(date +%Y%m%d_%H%M%S).sql"
+    sqlite3 "$DB" ".dump" > "$out"
+    echo "[+] Database exported: $out"
+    ls -la "$out"
+}
+
+# --- WEB DASHBOARD (now with adversarial views) ---
+serve_dashboard() {
+    local port="${1:-8080}"
+    echo -e "${CYAN}[+] Adversarial dashboard: http://localhost:$port${NC}"
+    
+    python3 -c "
+import http.server, socketserver, sqlite3, json, os, urllib.parse
+BASE = '$BASE'
+DB = '$DB'
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        q = urllib.parse.parse_qs(parsed.query)
+        
+        if path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            conn = sqlite3.connect(DB)
+            c = conn.cursor()
+            
+            # Stats
+            c.execute('SELECT COUNT(*), AVG(human_rating) FROM pain_points')
+            total_pain, avg_rating = c.fetchone()
+            total_pain = total_pain or 0
+            
+            c.execute('SELECT COUNT(*) FROM challenges')
+            total_quests = c.fetchone()[0]
+            
+            c.execute('SELECT COUNT(*) FROM user_progress')
+            total_users = c.fetchone()[0]
+            
+            c.execute('SELECT competitor, AVG(our_score - their_score) as advantage FROM competitive_intel GROUP BY competitor')
+            intel = c.fetchall()
+            
+            intel_rows = ''.join([
+                f'<tr><td>{comp}</td><td style=\\\"color:{"#00ff88" if adv > 0 else "#ff4444"}\\\">{adv:+.2f}</td></tr>'
+                for comp, adv in intel
+            ]) or '<tr><td colspan=2>No intel yet. Run: mentor --smash coderabbit</td></tr>'
+            
+            html = f'''<!DOCTYPE html>
+<html><head><meta charset=utf-8><title>CodeMentor Command Center</title>
+<style>
+body {{ background:#0a0a1a; color:#e0e0e0; font-family:'Courier New',monospace; margin:0; }}
+.header {{ background:linear-gradient(90deg,#1a1a3e,#0a0a1a); padding:20px; border-bottom:2px solid #00ff88; }}
+h1 {{ color:#00ff88; margin:0; }}
+.grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:15px; padding:20px; }}
+.card {{ background:#151528; border:1px solid #333; border-radius:8px; padding:15px; }}
+.card h3 {{ color:#00ccff; margin-top:0; font-size:0.9em; }}
+.num {{ font-size:2.5em; color:#00ff88; font-weight:bold; }}
+.section {{ padding:20px; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{ padding:10px; text-align:left; border-bottom:1px solid #333; }}
+th {{ color:#ffd93d; }}
+.red {{ color:#ff4444; }}
+.green {{ color:#00ff88; }}
+</style></head>
+<body>
+<div class=header><h1>🧠 CodeMentor Command Center</h1><p>Adversarial Intelligence Dashboard</p></div>
+<div class=grid>
+<div class=card><h3>PAIN POINTS LOGGED</h3><div class=num>{total_pain}</div></div>
+<div class=card><h3>ACTIVE QUESTS</h3><div class=num>{total_quests}</div></div>
+<div class=card><h3>DEVELOPERS TRACKED</h3><div class=num>{total_users}</div></div>
+<div class=card><h3>AVG RATING</h3><div class=num>{avg_rating or 'N/A'}</div></div>
+</div>
+<div class=section>
+<h2>⚔️ Competitive Intelligence</h2>
+<table><thead><tr><th>Competitor</th><th>Our Advantage</th></tr></thead>
+<tbody>{intel_rows}</tbody></table>
+</div>
+<div class=section>
+<h2>🗡️ Challenge Marketplace</h2>
+<p><a href=/quests style=color:#00ff88;text-decoration:none;>→ Browse Quests</a></p>
+</div>
+<p style=text-align:center;color:#888;padding:20px;>CodeMentor v2.1 | {os.popen('date -Iseconds').read().strip()}</p>
+</body></html>'''
+            self.wfile.write(html.encode())
+            conn.close()
+            
+        elif path == '/api/pain-points':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            conn = sqlite3.connect(DB)
+            c = conn.cursor()
+            c.execute('SELECT language, error_type, COUNT(*) as count FROM pain_points GROUP BY language, error_type ORDER BY count DESC LIMIT 20')
+            data = [{'lang':r[0],'error':r[1],'count':r[2]} for r in c.fetchall()]
+            self.wfile.write(json.dumps(data).encode())
+            conn.close()
+            
+        else:
+            self.send_error(404)
+            
+    def log_message(self, format, *args): pass
+
+with socketserver.TCPServer(('', $port), Handler) as httpd:
+    httpd.serve_forever()
+" || echo -e "${RED}[!] Server failed${NC}"
+}
+
+# --- MAIN ROUTER ---
+case "$1" in
+    --setup) setup; exit 0 ;;
+    --help|-h|"") show_help; exit 0 ;;
+    --quest) run_quest; exit 0 ;;
+    --battle) run_battle; exit 0 ;;
+    --leaderboard) 
+        python3 -c "import sqlite3; conn=sqlite3.connect('$DB'); c=conn.cursor(); c.execute('SELECT user_hash, xp, level, streak_days FROM user_progress ORDER BY xp DESC LIMIT 10'); [print(f'{i+1}. {row[0][:8]}... | XP:{row[1]} | Lvl:{row[2]} | 🔥{row[3]}d') for i,row in enumerate(c.fetchall())]; conn.close()"
+        exit 0 ;;
+    --marketplace)
+        python3 -c "import sqlite3; conn=sqlite3.connect('$DB'); c=conn.cursor(); c.execute('SELECT title, difficulty, bounty, solves FROM challenges ORDER BY bounty DESC'); [print(f'\\${row[2]:.0f} | {row[1]:>8} | {row[0]} | {row[3]} solves') for row in c.fetchall()]; conn.close()"
+        exit 0 ;;
+    --smash)
+        [[ -z "$2" ]] && { echo "Usage: mentor --smash <competitor_name>"; exit 1; }
+        echo -n "Our score [0-100]: "; read -r us; echo -n "Their score [0-100]: "; read -r them
+        log_competitive "$2" "overall" "$us" "$them"
+        exit 0 ;;
+    --intel)
+        python3 -c "import sqlite3; conn=sqlite3.connect('$DB'); c=conn.cursor(); c.execute('SELECT competitor, feature, our_score, their_score, timestamp FROM competitive_intel ORDER BY timestamp DESC LIMIT 20'); [print(f'{row[4]} | {row[0]:>12} | {row[1]:>20} | Us:{row[2]:>5} | Them:{row[3]:>5}') for row in c.fetchall()]; conn.close()"
+        exit 0 ;;
+    --cache-clear) rm -rf "$CACHE"/*; echo "Cache cleared."; exit 0 ;;
+    --report)
+        echo -e "${CYAN}=== ADMIRALTY INTELLIGENCE ===${NC}"
+        python3 -c "import sqlite3; conn=sqlite3.connect('$DB'); c=conn.cursor(); c.execute('SELECT COUNT(*), COUNT(DISTINCT language), COUNT(DISTINCT error_type) FROM pain_points'); row=c.fetchone(); print(f'Pain points: {row[0]} | Languages: {row[1]} | Error types: {row[2]}'); conn.close()"
+        ls -la "$ANALYTICS"/*.json 2>/dev/null | wc -l | xargs echo "Analytics reports:"
+        wc -l "$ANALYTICS"/usage_*.jsonl 2>/dev/null || echo "No usage logs yet"
+        exit 0 ;;
+    --serve) serve_dashboard "${2:-8080}"; exit 0 ;;
+    --export-db) export_db; exit 0 ;;
+    --git-push) git_push; exit 0 ;;
+esac
+
+# --- FILE PROCESSING (default mode) ---
+HTML_OUT=false
+EXTRA_FLAGS=""
+
+while [[ "$1" == --* ]]; do
+    case "$1" in
+        --html) HTML_OUT=true; shift ;;
+        --analytics-only) EXTRA_FLAGS="$EXTRA_FLAGS --analytics-only"; shift ;;
+        --chart) EXTRA_FLAGS="$EXTRA_FLAGS --chart"; shift ;;
+        *) shift ;;
+    esac
+done
+
+FILE="$1"
+START="${2:-}"
+END="${3:-}"
+
+[[ ! -f "$FILE" ]] && { echo -e "${RED}[!] File not found: $FILE${NC}"; exit 1; }
+
+# Log this pain point
+FILE_EXT="${FILE##*.}"
+ERROR_TYPE="explanation_request"
+
+if [[ "$EXTRA_FLAGS" == *"--analytics-only"* ]]; then
+    ERROR_TYPE="static_analysis"
+fi
+
+# Run analysis
+if [[ -n "$START" && -n "$END" ]]; then
+    RESULT=$(python3 "$BASE/lib/ai_explain.py" "$FILE" "$START" "$END" $EXTRA_FLAGS)
+else
+    RESULT=$(python3 "$BASE/lib/ai_explain.py" "$FILE" $EXTRA_FLAGS)
+fi
+
+# Log to adversarial database (async, don't block)
+(log_pain_point "$FILE_EXT" "$ERROR_TYPE" "$(head -c 500 "$FILE" | sed "s/'/''/g")" "$(echo "$RESULT" | head -c 1000 | sed "s/'/''/g")" 0 &) 2>/dev/null
+
+# XP for using the tool
+(add_xp 10 &) 2>/dev/null
+
+if [[ "$HTML_OUT" == true ]]; then
+    echo "$RESULT"
+else
+    echo "$RESULT" | sed \
+        -e 's/<h[123][^>]*>/\n\x1b[1;32m/g' -e 's/<\/h[123]>/\x1b[0m\n/g' \
+        -e 's/<li>/  • /g' -e 's/<\/li>//g' \
+        -e 's/<code>/\x1b[33m/g' -e 's/<\/code>/\x1b[0m/g' \
+        -e 's/<pre>/\n---\n\x1b[36m/g' -e 's/<\/pre>/\x1b[0m\n---\n/g' \
+        -e 's/<[^>]*>//g' | grep -v '^$' | head -200
+fi
+
+# --- API SERVER STARTER ---
+start_api() {
+    local port="${1:-8080}"
+    echo -e "${CYAN}[+] Starting CodeMentor API server on port $port${NC}"
+    echo -e "${YELLOW}[!] Frontend should proxy to http://localhost:$port${NC}"
+    python3 "$BASE/lib/api_server.py" "$port"
+}
+
+# Add to case statement in mentor:
+# api) start_api "${2:-8080}"; exit 0 ;;
+
+# --- API SERVER STARTER ---
+start_api() {
+    local port="${1:-8080}"
+    echo -e "${CYAN}[+] Starting CodeMentor API server on port $port${NC}"
+    echo -e "${YELLOW}[!] Frontend should proxy to http://localhost:$port${NC}"
+    python3 "$BASE/lib/api_server.py" "$port"
+}
+
+# Add to case statement in mentor:
+# api) start_api "${2:-8080}"; exit 0 ;;
