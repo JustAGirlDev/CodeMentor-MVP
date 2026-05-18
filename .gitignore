@@ -1,0 +1,24 @@
+# Secrets
+config/api.json
+config/*.key
+.git-credentials
+
+# Runtime data
+database/*.db
+database/*.db-journal
+cache/
+analytics/*.json
+analytics/*.png
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+*.swp
