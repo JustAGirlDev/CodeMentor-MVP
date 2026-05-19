@@ -38,3 +38,6 @@ Enterprise: 9/mo - Custom models, SSO, white-label
 
 Built with rage, caffeine, and a refusal to stay down.
 - JustAGirlDev
+- ## Support
+
+Love what we're building? Support Mike's work: https://ko-fi.com/MelissaStewart2567
